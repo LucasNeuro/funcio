@@ -1,19 +1,4 @@
-"""
-Entrada do AgentOS Vitual: carrega .env, constrói o agente e serve HTTP.
 
-Lógica do agente: vitual_agent_os.py
-
-Arranque:
-  pip install -r requirements.txt
-  python run.py
-
-Multi-agente Hub: com DATABASE_URL, por defeito carrega linhas de hub_agente_identidade
-(id Agno = agente_slug) e playbook via playbook_public_url. Ver vitual_agent_os.py (VITUAL_AGENTOS_*).
-
-Logs no terminal (.env):
-  VITUAL_ACCESS_LOG=1 — linha por cada pedido HTTP (default 1)
-  VITUAL_AGENT_DEBUG=1 — Agno debug (tools/model); também define AGNO_DEBUG
-"""
 from __future__ import annotations
 
 import os
