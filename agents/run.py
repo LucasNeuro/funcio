@@ -35,7 +35,7 @@ def _database_url_from_env() -> str:
 
 def _load_agents_env() -> Path:
     """
-    Carrega agents/.env com UTF-8 e fallback manual de DATABASE_URL (BOM / parser).
+    Carrega .env na mesma pasta que run.py (pasta agents/) com UTF-8 e fallback de DATABASE_URL (BOM / parser).
     """
     p = Path(__file__).resolve().parent / ".env"
     load_dotenv(p, override=True, encoding="utf-8")
@@ -71,10 +71,6 @@ try:
 except Exception:
     pass
 
-from vitual_agent_os import build_vitual_os
-
-agent_os, app, _db_tools, _db_state = build_vitual_os()
-
 def _configure_logging() -> None:
     """Logs no terminal durante pedidos HTTP e actividade Agno (tool/model)."""
     import logging
@@ -105,7 +101,25 @@ def _bind_ok(port: int) -> bool:
 if __name__ == "__main__":
     _configure_logging()
     host = os.getenv("AGNO_HOST", "0.0.0.0")
-    port = int(os.getenv("AGNO_PORT", "8000"))
+    # Render define PORT; localmente use AGNO_PORT ou 8000
+    _raw = (os.getenv("AGNO_PORT") or os.getenv("PORT") or "8000").strip()
+    try:
+        port = int(_raw)
+    except ValueError:
+        print(
+            f"[vitual] AGNO_PORT/PORT inválido ({_raw!r}); a usar 8000.",
+            file=sys.stderr,
+            flush=True,
+        )
+        port = 8000
+    if port <= 0 or port > 65535:
+        print(f"[vitual] porta fora do intervalo: {port}; a usar 8000.", file=sys.stderr, flush=True)
+        port = 8000
+
+    from vitual_agent_os import build_vitual_os
+
+    agent_os, app, _db_tools, _db_state = build_vitual_os()
+
     if not _bind_ok(port):
         print(
             f"Porta {port} ocupada. Feche o outro processo ou defina AGNO_PORT no .env",
@@ -124,9 +138,8 @@ if __name__ == "__main__":
         print("\n" + "=" * 72 + "\n", flush=True)
         if _db_state == "missing_url" or not has_url:
             print(
-                "AVISO: PostgresTools INATIVAS — DATABASE_URL não está definida em agents/.env\n"
-                "Supabase -> Project Settings -> Database -> Connection string (URI)\n"
-                "Grava o .env, para o servidor (Ctrl+C) e volta a correr: python run.py",
+                "AVISO: PostgresTools INATIVAS — DATABASE_URL não está definida.\n"
+                "No Render: Environment → DATABASE_URL. Local: ficheiro .env junto a run.py.\n",
                 flush=True,
             )
         elif _db_state.startswith("error:"):

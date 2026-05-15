@@ -707,7 +707,12 @@ def build_vitual_os() -> tuple[AgentOS, object, list, str]:
     """
     key = os.getenv("MISTRAL_API_KEY", "").strip()
     if not key:
-        print("Defina MISTRAL_API_KEY no ficheiro .env", file=sys.stderr)
+        print(
+            "MISTRAL_API_KEY em falta. No Render: Dashboard → Environment → adicionar MISTRAL_API_KEY. "
+            "Local: ficheiro .env na mesma pasta que run.py.",
+            file=sys.stderr,
+            flush=True,
+        )
         sys.exit(1)
 
     model_id = os.getenv("MISTRAL_MODEL", "mistral-large-latest").strip()

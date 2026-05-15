@@ -1,11 +1,12 @@
-# Render Blueprint — código na raiz do repo (requirements.txt + run.py).
+# Render Blueprint — Root Directory = agents (ver Settings no serviço ou usar este ficheiro).
 # https://render.com/docs/blueprint-spec
 services:
   - type: web
     name: funcio-agno
     runtime: python
+    rootDir: agents
     buildCommand: pip install -r requirements.txt
-    startCommand: AGNO_HOST=0.0.0.0 AGNO_PORT=$PORT python run.py
+    startCommand: python run.py
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8

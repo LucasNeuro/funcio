@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+agno.db
+agno_chat.db
+*.db-journal
+agno_sessions/
+exports/
