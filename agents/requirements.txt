@@ -1,0 +1,13 @@
+agno>=2.3.0
+mistralai>=1.0.0
+python-dotenv
+httpx>=0.27.0
+certifi
+truststore>=0.9.0
+uvicorn[standard]>=0.30.0
+# Postgres (Supabase) — PostgresTools
+psycopg[binary]>=3.0.0
+# PDFs via FileGenerationTools (Agno)
+reportlab>=4.0.0
+# CustomApiTools (Supabase REST)
+requests>=2.31.0
