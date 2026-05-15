@@ -1,10 +1,9 @@
-# Blueprint Render: define rootDir=agents para o build encontrar requirements.txt e runtime.txt.
-# Ver: https://render.com/docs/blueprint-spec
+# Render Blueprint — código na raiz do repo (requirements.txt + run.py).
+# https://render.com/docs/blueprint-spec
 services:
   - type: web
     name: funcio-agno
     runtime: python
-    rootDir: agents
     buildCommand: pip install -r requirements.txt
     startCommand: AGNO_HOST=0.0.0.0 AGNO_PORT=$PORT python run.py
     envVars:
