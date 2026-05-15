@@ -6,8 +6,8 @@ services:
     name: funcio-agno
     runtime: python
     buildCommand: pip install -r requirements.txt
-    # Sem `cd agents` o Render corre em /src e falha: run.py está em agents/run.py
-    startCommand: cd agents && AGNO_HOST=0.0.0.0 AGNO_PORT=$PORT python run.py
+    # Raiz tem run.py que faz chdir para agents/ (compatível com painel que só corre ``python run.py``).
+    startCommand: AGNO_HOST=0.0.0.0 AGNO_PORT=$PORT python run.py
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8
