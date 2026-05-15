@@ -1,3 +1,53 @@
+"""
+Vitual — montagem do AgentOS: Mistral + SqliteDb (sessões) + PostgresTools (opcional) + exportação de ficheiros.
+
+Requer variáveis de ambiente já carregadas (ex.: run.py chama load_dotenv antes do import).
+
+agents/.env (carregado por run.py antes deste módulo):
+
+  Mistral
+  MISTRAL_API_KEY — obrigatório
+  MISTRAL_MODEL — opcional (default mistral-large-latest)
+  MISTRAL_CLIENT_TIMEOUT_SEC — opcional; timeout pedidos API em segundos (ex. 120)
+  AGENT_TOOL_CHOICE ou MISTRAL_TOOL_CHOICE — opcional; ex. any força uso de uma tool (útil com perguntas à BD)
+
+  Postgres (PostgresTools Agno)
+  DATABASE_URL (preferido) ou SUPABASE_DATABASE_URL ou POSTGRES_URL — opcional; URI Postgres
+  SUPABASE_DB_SCHEMA — opcional (default public)
+  VITUAL_POSTGRES_TOOLS — opcional; subconjunto separado por vírgulas; vazio = todas as 6 funções
+  VITUAL_PG_STATEMENT_TIMEOUT_MS — opcional (default 60000); cancela queries lentas (ms)
+
+  Supabase REST (CustomApiTools), só se VITUAL_SUPABASE_REST=1
+  SUPABASE_URL ou NEXT_PUBLIC_SUPABASE_URL ou VITE_SUPABASE_URL — URL do projecto
+  SUPABASE_ANON_KEY ou NEXT_PUBLIC_SUPABASE_ANON_KEY — chave anon (default sem service role)
+  SUPABASE_SERVICE_ROLE_KEY — usada se VITUAL_SUPABASE_USE_SERVICE_ROLE=1 (ignora RLS na REST)
+  VITUAL_SUPABASE_USE_SERVICE_ROLE — 1 service role; 0 ou omitido = anon
+
+  Outras flags Vitual
+  VITUAL_FILE_EXPORT — opcional (default 1); 0 desactiva FileGenerationTools (PDF/CSV/JSON/TXT)
+  VITUAL_SUPABASE_REST — 1 activa REST /rest/v1; 0 ou omitido = PostgresTools + exportação local (sem PostgREST)
+  VITUAL_LOCAL_PDF — opcional; 1 força PDF local; 0 desliga; omitido = PDF ligado com FileGeneration
+  VITUAL_SUPABASE_USE_SERVICE_ROLE — 1 para PostgREST com SERVICE_ROLE_KEY (ignora RLS); 0 ou omitido = anon
+  VITUAL_NUM_HISTORY_RUNS — opcional (default 5); turnos recentes no contexto (1–30)
+  VITUAL_AGENT_DEBUG — opcional; 1 activa debug Agno (run.py também define AGNO_DEBUG=true)
+
+  Cliente HTTP → API Mistral (httpx)
+  AGNO_HTTP_VERIFY — 0 desactiva verificação SSL (só desenvolvimento)
+  AGNO_SSL_PREFER_CERTIFI — 1 força bundle Mozilla (certifi)
+  AGNO_SSL_USE_TRUSTSTORE — 0 força certifi (compat. com nomes antigos); por defeito usa truststore (loja do SO)
+
+  (Hub multi-agente / Storage Markdown em Supabase — reactivar mais tarde.)
+
+  Servidor / logs (lidos em run.py, mesmo .env)
+  AGNO_HOST — opcional (default 0.0.0.0)
+  AGNO_PORT — opcional (default 8000)
+  VITUAL_LOG_LEVEL — opcional (default INFO no logging; uvicorn usa a mesma variável em minúsculas)
+  VITUAL_ACCESS_LOG — opcional (default 1); 0 desactiva access log uvicorn
+
+Docs Agno (tools): https://docs.agno.com/tools/overview
+Docs Agno PostgresTools: https://docs.agno.com/tools/toolkits/database/postgres
+File generation: https://docs.agno.com (File Generation Tools)
+"""
 from __future__ import annotations
 
 import os
@@ -11,11 +61,11 @@ from agno.agent import Agent
 from agno.db.sqlite import SqliteDb
 from agno.models.mistral import MistralChat
 from agno.os import AgentOS
-from agno.tools import Toolkit
 from agno.tools.file_generation import FileGenerationTools
 
 _ROOT = Path(__file__).resolve().parent
 _EXPORTS = _ROOT / "exports"
+_debug = os.getenv("VITUAL_AGENT_DEBUG", "0").strip().lower() in ("1", "true", "yes")
 
 try:
     import certifi as _certifi_boot
@@ -77,172 +127,6 @@ def _pg_schema_and_timeout_ms() -> tuple[str, int]:
     return schema, st_ms
 
 
-def _fetch_playbook_markdown(url: str | None, *, max_bytes: int) -> str | None:
-    u = (url or "").strip()
-    if not u:
-        return None
-    try:
-        with httpx.Client(timeout=60.0, verify=_httpx_verify_ssl()) as client:
-            r = client.get(
-                u,
-                headers={"Accept": "text/markdown, text/plain, application/json, */*"},
-            )
-        if r.status_code != 200:
-            print(
-                f"Hub playbook HTTP {r.status_code} para {u[:120]}…",
-                file=sys.stderr,
-            )
-            return None
-        body = r.content
-        if len(body) > max_bytes:
-            print(
-                f"Hub playbook excede {max_bytes} bytes ({len(body)}); truncando.",
-                file=sys.stderr,
-            )
-            body = body[:max_bytes]
-        return body.decode("utf-8", errors="replace")
-    except Exception as e:
-        print(f"Hub playbook: falha ao ler URL: {type(e).__name__}: {e}", file=sys.stderr)
-        return None
-
-
-def _load_hub_agents_rows() -> list[dict]:
-    """
-    Lê agentes do Hub para um AgentOS multi-agente (id Agno = agente_slug).
-
-    Controlos (``agents/.env``):
-      VITUAL_AGENTOS_FROM_HUB — 0 desliga (só agente ``chat`` legacy).
-      VITUAL_AGENTOS_TENANT_ID ou DEFAULT_TENANT_ID — filtra ``tenant_id`` (uuid).
-      VITUAL_AGENTOS_SLUGS — lista separada por vírgulas (subconjunto).
-    """
-    if os.getenv("VITUAL_AGENTOS_FROM_HUB", "1").strip().lower() in ("0", "false", "no"):
-        return []
-    dsn = _postgres_dsn_normalized()
-    if not dsn:
-        return []
-    try:
-        import psycopg
-        from psycopg import errors as pg_errors
-        from psycopg.rows import dict_row
-    except ImportError:
-        print("Hub agentes: instale psycopg (pip install 'psycopg[binary]')", file=sys.stderr)
-        return []
-
-    schema, st_ms = _pg_schema_and_timeout_ms()
-    opts = f"-c search_path={schema} -c statement_timeout={st_ms}"
-
-    tenant = (os.getenv("VITUAL_AGENTOS_TENANT_ID") or os.getenv("DEFAULT_TENANT_ID") or "").strip()
-    slugs_raw = (os.getenv("VITUAL_AGENTOS_SLUGS") or "").strip()
-    wanted = {s.strip() for s in slugs_raw.split(",") if s.strip()} if slugs_raw else None
-
-    def _run_sql(
-        sql: str,
-        params: tuple | list | None,
-    ) -> list[dict]:
-        with psycopg.connect(
-            dsn,
-            row_factory=dict_row,
-            connect_timeout=30,
-            options=opts,
-        ) as conn:
-            conn.read_only = True
-            cur = conn.execute(sql, params or ())
-            return list(cur.fetchall())
-
-    sql_with_arch = """
-        SELECT agente_slug, nome, system_prompt_base, playbook_public_url, modo_operacao
-        FROM hub_agente_identidade
-        WHERE ativo IS NOT FALSE
-          AND arquivado_em IS NULL
-    """
-    params: list = []
-    if tenant:
-        sql_with_arch += " AND tenant_id = %s::uuid"
-        params.append(tenant)
-    sql_with_arch += " ORDER BY nivel NULLS LAST, nome NULLS LAST, agente_slug"
-
-    sql_min = """
-        SELECT agente_slug, nome, system_prompt_base, playbook_public_url, modo_operacao
-        FROM hub_agente_identidade
-        WHERE ativo IS NOT FALSE
-        ORDER BY nivel NULLS LAST, nome NULLS LAST, agente_slug
-    """
-    sql_arch_no_tenant = """
-        SELECT agente_slug, nome, system_prompt_base, playbook_public_url, modo_operacao
-        FROM hub_agente_identidade
-        WHERE ativo IS NOT FALSE
-          AND arquivado_em IS NULL
-        ORDER BY nivel NULLS LAST, nome NULLS LAST, agente_slug
-    """
-    rows: list[dict] = []
-    try:
-        rows = _run_sql(sql_with_arch, params)
-    except pg_errors.UndefinedColumn:
-        try:
-            rows = _run_sql(sql_arch_no_tenant, ())
-        except pg_errors.UndefinedColumn:
-            try:
-                rows = _run_sql(sql_min, ())
-            except Exception as e:
-                print(f"Hub agentes: {type(e).__name__}: {e}", file=sys.stderr)
-                return []
-        except Exception as e:
-            print(f"Hub agentes: {type(e).__name__}: {e}", file=sys.stderr)
-            return []
-    except Exception as e:
-        print(f"Hub agentes: {type(e).__name__}: {e}", file=sys.stderr)
-        return []
-
-    if wanted:
-        rows = [r for r in rows if (r.get("agente_slug") or "") in wanted]
-
-    if not rows:
-        print("Hub agentes: nenhuma linha em hub_agente_identidade (filtros activos).", flush=True)
-    else:
-        print(f"Hub agentes: {len(rows)} agente(s) para AgentOS.", flush=True)
-    return rows
-
-
-def _hub_playbook_max_bytes() -> int:
-    try:
-        n = int((os.getenv("VITUAL_AGENTOS_PLAYBOOK_MAX_BYTES") or "500000").strip())
-        return max(8_192, min(n, 5_000_000))
-    except ValueError:
-        return 500_000
-
-
-def _instructions_hub_agent(
-    base_instructions: str,
-    *,
-    agente_slug: str,
-    nome: str,
-    modo_operacao: str | None,
-    playbook_md: str | None,
-    system_prompt_base: str | None,
-) -> str:
-    modo = (modo_operacao or "").strip()
-    block = (
-        f"\n\n## Contexto CRM (Hub)\n"
-        f"- **agente_slug:** `{agente_slug}`\n"
-        f"- **nome:** {nome.strip() or agente_slug}\n"
-    )
-    if modo:
-        block += f"- **modo_operacao:** `{modo}`\n"
-    parts = [base_instructions, block]
-    if playbook_md and playbook_md.strip():
-        parts.append("\n---\n\n# Playbook (Markdown do Hub)\n\n")
-        parts.append(playbook_md.strip())
-    elif system_prompt_base and str(system_prompt_base).strip():
-        parts.append("\n---\n\n# Prompt base (Hub)\n\n")
-        parts.append(str(system_prompt_base).strip())
-    else:
-        parts.append(
-            "\n\n_(Este agente não tem playbook_public_url nem system_prompt_base preenchido no Hub; "
-            "segue só as regras globais e ferramentas.)_"
-        )
-    return "".join(parts)
-
-
 def mistral_http_clients() -> tuple[httpx.Client, httpx.AsyncClient]:
     """
     Clientes HTTP para o SDK Mistral (sync + async/stream).
@@ -281,164 +165,6 @@ def mistral_http_clients() -> tuple[httpx.Client, httpx.AsyncClient]:
         httpx.Client(verify=verify, timeout=timeout),
         httpx.AsyncClient(verify=verify, timeout=timeout),
     )
-
-
-def _httpx_verify_ssl() -> bool | str | ssl.SSLContext:
-    """Verificação SSL para clientes httpx síncronos (alinhado com mistral_http_clients)."""
-    if os.getenv("AGNO_HTTP_VERIFY", "1").strip().lower() in ("0", "false", "no"):
-        return False
-    prefer_certifi = os.getenv("AGNO_SSL_PREFER_CERTIFI", "0").strip().lower() in ("1", "true", "yes")
-    legacy_certifi = os.getenv("AGNO_SSL_USE_TRUSTSTORE", "").strip().lower() in ("0", "false", "no")
-    prefer_certifi = prefer_certifi or legacy_certifi
-    if not prefer_certifi:
-        try:
-            import truststore
-
-            return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        except Exception:
-            prefer_certifi = True
-    if prefer_certifi:
-        import certifi
-
-        cafile = certifi.where()
-        os.environ.setdefault("SSL_CERT_FILE", cafile)
-        os.environ.setdefault("REQUESTS_CA_BUNDLE", cafile)
-        return cafile
-    return True
-
-
-class VitualSupabaseStorageToolkit(Toolkit):
-    """Relatórios Markdown → Supabase Storage (POST /storage/v1/object/...)."""
-
-    def __init__(
-        self,
-        *,
-        base_url: str,
-        api_key: str,
-        bucket: str,
-        path_prefix: str = "",
-        httpx_verify: bool | str | ssl.SSLContext = True,
-        public_read_hint: bool = False,
-    ):
-        self._base = base_url.rstrip("/")
-        self._key = api_key
-        self._bucket = bucket.strip()
-        self._prefix = path_prefix.strip().strip("/")
-        self._httpx_verify = httpx_verify
-        self._public_read_hint = public_read_hint
-        super().__init__(
-            name="vitual_supabase_storage",
-            tools=[self.upload_markdown_report],
-        )
-
-    def _object_key(self, filename: str) -> tuple[str | None, str | None]:
-        raw = (filename or "").strip()
-        if not raw:
-            return None, "filename vazio"
-        base_name = Path(raw).name
-        if not base_name or base_name in (".", ".."):
-            return None, "filename inválido"
-        safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in base_name)
-        if not safe.lower().endswith(".md"):
-            safe += ".md"
-        if self._prefix:
-            return f"{self._prefix}/{safe}", None
-        return safe, None
-
-    def upload_markdown_report(self, markdown: str, filename: str) -> str:
-        """
-        Grava um relatório em Markdown no bucket Supabase configurado.
-
-        Args:
-            markdown: Texto completo do relatório (títulos #, listas, tabelas Markdown).
-            filename: Nome do ficheiro, ex. relatorio_leads_maio.md (só o basename é usado; é sanitizado).
-        """
-        key, err = self._object_key(filename)
-        if not key:
-            return f"Error: {err}"
-        if not (markdown and str(markdown).strip()):
-            return "Error: markdown vazio"
-        url = f"{self._base}/storage/v1/object/{self._bucket}/{key}"
-        headers = {
-            "Authorization": f"Bearer {self._key}",
-            "apikey": self._key,
-            "Content-Type": "text/markdown; charset=utf-8",
-        }
-        try:
-            with httpx.Client(timeout=120.0, verify=self._httpx_verify) as client:
-                r = client.post(
-                    url,
-                    headers=headers,
-                    content=str(markdown).encode("utf-8"),
-                    params={"upsert": "true"},
-                )
-        except Exception as e:
-            return f"Error: pedido HTTP falhou: {type(e).__name__}: {e}"
-        if r.status_code not in (200, 201):
-            return f"Error: Storage HTTP {r.status_code}: {r.text[:800]}"
-        extra = ""
-        if self._public_read_hint:
-            extra = (
-                f" | URL pública (se o bucket for público): "
-                f"{self._base}/storage/v1/object/public/{self._bucket}/{key}"
-            )
-        return f"OK: Markdown gravado no Storage em {self._bucket}/{key}.{extra}"
-
-
-def vitual_supabase_storage_tools() -> list:
-    """Upload de relatórios .md para Supabase Storage.
-
-    Activo se ``VITUAL_SUPABASE_STORAGE_BUCKET`` estiver definido e
-    ``VITUAL_SUPABASE_STORAGE`` não for 0/false/no.
-    """
-    if os.getenv("VITUAL_SUPABASE_STORAGE", "").strip().lower() in ("0", "false", "no"):
-        return []
-    bucket = (os.getenv("VITUAL_SUPABASE_STORAGE_BUCKET") or "").strip()
-    if not bucket:
-        return []
-    base = _env_first("SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL", "VITE_SUPABASE_URL").rstrip("/")
-    if not base:
-        print(
-            "Supabase Storage: falta SUPABASE_URL ou NEXT_PUBLIC_SUPABASE_URL",
-            file=sys.stderr,
-        )
-        return []
-    use_svc = os.getenv("VITUAL_SUPABASE_STORAGE_USE_SERVICE_ROLE", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-    if not use_svc:
-        use_svc = os.getenv("VITUAL_SUPABASE_USE_SERVICE_ROLE", "0").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-        )
-    key = (
-        _env_first("SUPABASE_SERVICE_ROLE_KEY")
-        if use_svc
-        else _env_first("SUPABASE_ANON_KEY", "NEXT_PUBLIC_SUPABASE_ANON_KEY")
-    )
-    if not key:
-        key = _env_first("SUPABASE_SERVICE_ROLE_KEY")
-    if not key:
-        print("Supabase Storage: falta SUPABASE_SERVICE_ROLE_KEY ou SUPABASE_ANON_KEY", file=sys.stderr)
-        return []
-    prefix = (os.getenv("VITUAL_SUPABASE_STORAGE_PREFIX") or "relatorios").strip().strip("/")
-    public_hint = os.getenv("VITUAL_SUPABASE_STORAGE_PUBLIC_READ", "0").strip().lower() in ("1", "true", "yes")
-    t = VitualSupabaseStorageToolkit(
-        base_url=base,
-        api_key=key,
-        bucket=bucket,
-        path_prefix=prefix,
-        httpx_verify=_httpx_verify_ssl(),
-        public_read_hint=public_hint,
-    )
-    print(
-        f"Supabase Storage: bucket={bucket} prefix={prefix or '(raiz)'} auth={'service_role' if use_svc else 'anon'}",
-        flush=True,
-    )
-    return [t]
 
 
 def crm_postgres_tools() -> tuple[list, str]:
@@ -602,17 +328,11 @@ def vitual_supabase_rest_tools() -> list:
 
 
 def _local_pdf_enabled() -> bool:
-    """PDF local: desligado por defeito quando há bucket Storage configurado (e Storage não está explicitamente off)."""
-    bucket_cfg = (os.getenv("VITUAL_SUPABASE_STORAGE_BUCKET") or "").strip()
-    storage_explicit_off = os.getenv("VITUAL_SUPABASE_STORAGE", "").strip().lower() in ("0", "false", "no")
+    """PDF local (FileGenerationTools): VITUAL_LOCAL_PDF=0 desliga; omitido ou 1 = ligado."""
     local_pdf_raw = (os.getenv("VITUAL_LOCAL_PDF") or "").strip().lower()
-    if local_pdf_raw in ("1", "true", "yes"):
-        return True
     if local_pdf_raw in ("0", "false", "no"):
         return False
-    if storage_explicit_off:
-        return True
-    return not bool(bucket_cfg)
+    return True
 
 
 def vitual_file_generation_tools() -> list:
@@ -693,32 +413,20 @@ def build_vitual_os() -> tuple[AgentOS, object, list, str]:
             "Para perguntas sobre dados: começa por show_tables; run_query só SELECT com LIMIT em tabelas grandes."
         )
 
-    storage_tools = vitual_supabase_storage_tools()
     file_tools = vitual_file_generation_tools()
     rest_tools = vitual_supabase_rest_tools()
-
-    if storage_tools:
-        base_instructions += (
-            " REGRA OBRIGATÓRIA — relatórios na nuvem: tens a ferramenta upload_markdown_report (bucket Supabase). "
-            "Sempre que o utilizador pedir relatório, exportação, sumário guardado ou guardar no bucket, "
-            "compõe o relatório em Markdown completo (# títulos, listas, tabelas em MD) e chama "
-            "upload_markdown_report com o texto completo e filename terminado em .md (ex.: relatorio_leads_maio.md). "
-            "NÃO uses generate_pdf_file para esse pedido; PDF local só se o utilizador pedir explicitamente PDF. "
-            "Na resposta ao utilizador, menciona o caminho no bucket que a tool devolver (linha OK:)."
-        )
 
     if file_tools:
         pdf_avail = _local_pdf_enabled()
         if pdf_avail:
             base_instructions += (
                 " Ficheiros locais (pasta exports): generate_pdf_file (PDF), generate_csv_file, generate_json_file, "
-                "generate_text_file. Se o Storage Markdown estiver disponível, preferência para relatórios é "
-                "upload_markdown_report, não PDF."
+                "generate_text_file."
             )
         else:
             base_instructions += (
                 " Ficheiros locais (pasta exports): generate_csv_file, generate_json_file, generate_text_file. "
-                "PDF local está desligado; relatórios vão em Markdown com upload_markdown_report."
+                "PDF local está desligado (VITUAL_LOCAL_PDF=0)."
             )
 
     if rest_tools:
@@ -728,12 +436,7 @@ def build_vitual_os() -> tuple[AgentOS, object, list, str]:
             "Com chave anon respeita-se RLS; não faças PATCH/DELETE sem o utilizador pedir explicitamente."
         )
 
-    if storage_tools:
-        base_instructions += (
-            " O caminho no Supabase usa o prefixo do servidor; não digas que gravaste em C:... para arquivo na nuvem."
-        )
-
-    all_tools = [*db_tools, *file_tools, *rest_tools, *storage_tools]
+    all_tools = [*db_tools, *file_tools, *rest_tools]
 
     try:
         _hr = int((os.getenv("VITUAL_NUM_HISTORY_RUNS") or "5").strip())
@@ -741,99 +444,25 @@ def build_vitual_os() -> tuple[AgentOS, object, list, str]:
     except ValueError:
         num_history_runs = 5
 
-    hub_rows = _load_hub_agents_rows()
-    playbook_max = _hub_playbook_max_bytes()
-    sessions_dir = _ROOT / "agno_sessions"
-    sessions_dir.mkdir(parents=True, exist_ok=True)
-
-    agents_list: list[Agent] = []
-    first_hub_instructions: str | None = None
-
-    if hub_rows:
-        seen_ids: set[str] = set()
-        for row in hub_rows:
-            slug = str(row.get("agente_slug") or "").strip()
-            if not slug or slug in seen_ids:
-                continue
-            seen_ids.add(slug)
-            nome = str(row.get("nome") or slug).strip() or slug
-            display_name = nome[:120] if len(nome) > 120 else nome
-            url = row.get("playbook_public_url")
-            playbook = _fetch_playbook_markdown(
-                str(url) if url else None,
-                max_bytes=playbook_max,
-            )
-            instr = _instructions_hub_agent(
-                base_instructions,
-                agente_slug=slug,
-                nome=nome,
-                modo_operacao=row.get("modo_operacao"),
-                playbook_md=playbook,
-                system_prompt_base=row.get("system_prompt_base"),
-            )
-            if first_hub_instructions is None:
-                first_hub_instructions = instr
-            db_path = sessions_dir / f"{slug}.db"
-            agents_list.append(
-                Agent(
-                    id=slug,
-                    name=display_name,
-                    model=MistralChat(**_m_kw),
-                    instructions=instr,
-                    tools=all_tools,
-                    tool_choice=tool_choice,
-                    markdown=True,
-                    add_history_to_context=True,
-                    num_history_runs=num_history_runs,
-                    db=SqliteDb(db_file=str(db_path)),
-                    debug_mode=_debug,
-                )
-            )
-
-    legacy_chat = os.getenv("VITUAL_AGENTOS_LEGACY_CHAT", "1").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-    if agents_list and legacy_chat and first_hub_instructions:
-        if not any(a.id == "chat" for a in agents_list):
-            agents_list.append(
-                Agent(
-                    id="chat",
-                    name="Chat",
-                    model=MistralChat(**_m_kw),
-                    instructions=first_hub_instructions,
-                    tools=all_tools,
-                    tool_choice=tool_choice,
-                    markdown=True,
-                    add_history_to_context=True,
-                    num_history_runs=num_history_runs,
-                    db=SqliteDb(db_file=str(_ROOT / "agno.db")),
-                    debug_mode=_debug,
-                )
-            )
-
-    if not agents_list:
-        agents_list = [
-            Agent(
-                id="chat",
-                name="Chat",
-                model=MistralChat(**_m_kw),
-                instructions=base_instructions,
-                tools=all_tools,
-                tool_choice=tool_choice,
-                markdown=True,
-                add_history_to_context=True,
-                num_history_runs=num_history_runs,
-                db=SqliteDb(db_file=str(_ROOT / "agno.db")),
-                debug_mode=_debug,
-            )
-        ]
+    agents_list: list[Agent] = [
+        Agent(
+            id="chat",
+            name="Chat",
+            model=MistralChat(**_m_kw),
+            instructions=base_instructions,
+            tools=all_tools,
+            tool_choice=tool_choice,
+            markdown=True,
+            add_history_to_context=True,
+            num_history_runs=num_history_runs,
+            db=SqliteDb(db_file=str(_ROOT / "agno.db")),
+            debug_mode=_debug,
+        )
+    ]
 
     os_description = (
-        f"Vitual AgentOS — {len(agents_list)} agente(s): "
-        + ", ".join(a.id for a in agents_list)
-        + ". Postgres + ficheiros + opcional REST + Markdown → Storage."
+        "Vitual AgentOS — agente único (chat): PostgresTools (opcional) + exportação de ficheiros + "
+        "PostgREST (opcional, VITUAL_SUPABASE_REST=1)."
     )
 
     agent_os = AgentOS(
